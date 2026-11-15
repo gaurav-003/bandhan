@@ -1,0 +1,10 @@
+# Bandhan backend — never commit secrets
+.env
+node_modules/
+dist/
+uploads/
+*.log
+.DS_Store
+
+pgdata/
+*.rdb

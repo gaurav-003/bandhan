@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Email confirmed — Bandhan</title>
+<style>
+  body { font-family: Georgia, serif; background:#fff8ec; color:#3b1f2b; margin:0; padding:32px 16px; }
+  .card { max-width:480px; margin:40px auto; background:#fff; border:1px solid #e8d5a3; border-radius:16px; padding:32px; text-align:center; }
+  h1 { color:#8a6d1b; letter-spacing:4px; margin:0 0 4px; font-size:26px; }
+  .tag { color:#8a6d1b; letter-spacing:2px; font-size:12px; margin:0 0 24px; }
+  h2 { margin:0 0 8px; font-size:22px; }
+  p { line-height:1.6; color:#7a6a55; }
+  label { display:block; text-align:left; font-size:12px; letter-spacing:2px; color:#8a6d1b; margin:16px 0 6px; }
+  input { width:100%; box-sizing:border-box; padding:12px 14px; border:1px solid #d9c48a; border-radius:10px; font-size:16px; }
+  button { width:100%; margin-top:22px; background:#c9a227; color:#fff; border:0; font-weight:bold; font-size:17px; padding:14px; border-radius:999px; cursor:pointer; }
+  #msg { margin-top:16px; min-height:20px; font-weight:bold; }
+  .ok { color:#1e7d32; } .err { color:#b3261e; }
+</style></head>
+<body>
+<div class="card">
+  <h1>BANDHAN</h1>
+  <p class="tag">TWO SOULS &middot; ONE STORY</p>
+  <h2>Email confirmed!</h2>
+  <p id="sub">Ab apna password set karo — phir tumhara Bandhan account ready hai.</p>
+  <form id="pwform">
+    <label for="pw">PASSWORD (MIN 8 CHARACTERS)</label>
+    <input id="pw" type="password" required minlength="8" placeholder="Choose a password" autocomplete="new-password">
+    <label for="pw2">CONFIRM PASSWORD</label>
+    <input id="pw2" type="password" required minlength="8" placeholder="Type it again" autocomplete="new-password">
+    <button type="submit">Set password &amp; continue</button>
+  </form>
+  <div id="msg"></div>
+</div>
+<script src="/confirmed.js"></script>
+</body></html>

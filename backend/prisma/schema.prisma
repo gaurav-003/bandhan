@@ -1,0 +1,176 @@
+// Bandhan backend — Prisma schema (Phase 1)
+// Database: PostgreSQL 16.2 (pgserver, Unix socket only)
+// NOTE: DATABASE_URL .env me socket format me hai — use mat badalna.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum Gender {
+  MALE
+  FEMALE
+}
+
+enum PackageName {
+  FREE
+  SILVER
+  GOLD
+  PLATINUM
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  CREATED
+  PAID
+  FAILED
+}
+
+enum InterestStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+}
+
+model User {
+  id                String         @id @default(cuid())
+  email             String         @unique
+  phone             String?        @unique
+  passwordHash      String?
+  role              Role           @default(USER)
+  isVerified        Boolean        @default(false)
+  emailVerified     Boolean        @default(false) // email confirmation link se verify hota hai
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  profile           Profile?
+  subscriptions     Subscription[]
+  payments          Payment[]
+  interestsSent     Interest[]     @relation("InterestFrom")
+  interestsReceived Interest[]     @relation("InterestTo")
+  shortlists        Shortlist[]
+}
+
+model Profile {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  gender        Gender
+  firstName     String
+  lastName      String
+  dob           DateTime
+  age           Int
+  heightCm      Int?
+  education     String
+  profession    String
+  incomeAnnual  Int?
+  city          String
+  state         String   @default("")
+  religion      String?
+  caste         String?
+  maritalStatus String   @default("Never Married")
+  about         String?
+  isActive      Boolean  @default(true)
+  isVerified    Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  photos        Photo[]
+  shortlistedBy Shortlist[]
+}
+
+model Photo {
+  id        String   @id @default(cuid())
+  profileId String
+  profile   Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  url       String
+  isPrimary Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([profileId])
+}
+
+model Package {
+  id                 String         @id @default(cuid())
+  name               PackageName    @unique
+  pricePaise         Int
+  durationDays       Int
+  maxProfilesVisible Int
+  canSeePhotos       Boolean        @default(false)
+  canSeeBiodata      Boolean        @default(false)
+  canSeeContacts     Boolean        @default(false)
+  canSendInterest    Boolean        @default(false)
+  isVerifiedBadge    Boolean        @default(false)
+  priorityListing    Boolean        @default(false)
+  createdAt          DateTime       @default(now())
+  subscriptions      Subscription[]
+}
+
+model Subscription {
+  id         String             @id @default(cuid())
+  userId     String
+  user       User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  packageId  String
+  package    Package            @relation(fields: [packageId], references: [id])
+  status     SubscriptionStatus @default(ACTIVE)
+  startsAt   DateTime           @default(now())
+  endsAt     DateTime
+  createdAt  DateTime           @default(now())
+  payments   Payment[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+model Payment {
+  id                String        @id @default(cuid())
+  userId            String
+  user              User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscriptionId    String?
+  subscription      Subscription? @relation(fields: [subscriptionId], references: [id])
+  razorpayOrderId   String        @unique
+  razorpayPaymentId String?
+  amountPaise       Int
+  currency          String        @default("INR")
+  status            PaymentStatus @default(CREATED)
+  createdAt         DateTime      @default(now())
+
+  @@index([userId])
+}
+
+model Interest {
+  id         String         @id @default(cuid())
+  fromUserId String
+  fromUser   User           @relation("InterestFrom", fields: [fromUserId], references: [id], onDelete: Cascade)
+  toUserId   String
+  toUser     User           @relation("InterestTo", fields: [toUserId], references: [id], onDelete: Cascade)
+  status     InterestStatus @default(PENDING)
+  createdAt  DateTime       @default(now())
+
+  @@unique([fromUserId, toUserId])
+  @@index([toUserId])
+}
+
+model Shortlist {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  profileId String
+  profile   Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, profileId])
+  @@index([userId])
+}
