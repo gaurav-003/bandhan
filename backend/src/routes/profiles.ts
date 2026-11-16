@@ -1,24 +1,27 @@
 // Profile routes — sab requireAuth.
-// Phase 1 me package gating NAHI hai (wo Phase 2 me aayega) — search me
-// saare active profiles + photos + biodata dikhte hain.
+// Package gating BACKEND pe enforce hota hai (src/lib/gating.ts):
+// Free user ko sirf blurred thumbnail + limited biodata, paid user ko signed
+// original photo (5 min) + poora biodata. Frontend CSS blur par bharosa nahi.
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import multer from 'multer';
 import sharp from 'sharp';
-import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
 import { prisma } from '../lib/prisma';
 import { validate, ageFromDob } from '../middleware/validate';
 import { requireAuth } from '../middleware/auth';
+import { getPermissions, Permissions } from '../lib/gating';
+import { uploadPhoto, deletePhoto, signedPhotoUrl, verifyPhotoSig, localFilePath } from '../lib/storage';
+import { logAudit } from '../lib/audit';
+import { cacheGet, cacheSet } from '../lib/cache';
 
 const router = Router();
 
-const UPLOADS_DIR = path.join(__dirname, '..', '..', 'uploads');
-fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-
 const MAX_PHOTOS_PER_PROFILE = 5;
 const MAX_FILE_BYTES = 5 * 1024 * 1024; // 5 MB
+const MAX_DIMENSION = 2000;
+const PAGE_SIZE = 20; // fixed — user control nahi kar sakta
 const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp'];
 
 const upload = multer({
@@ -29,6 +32,24 @@ const upload = multer({
     else cb(new Error('Sirf JPEG/PNG/WebP images allowed hain'));
   },
 });
+
+/** Magic bytes check — extension/mimetype par bharosa mat karo. */
+function checkMagicBytes(buf: Buffer): boolean {
+  if (buf.length < 12) return false;
+  // JPEG: FF D8 FF
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return true;
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  if (
+    buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47 &&
+    buf[4] === 0x0d && buf[5] === 0x0a && buf[6] === 0x1a && buf[7] === 0x0a
+  ) return true;
+  // WebP: RIFF....WEBP
+  if (
+    buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+    buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50
+  ) return true;
+  return false;
+}
 
 const profileCreateSchema = z.object({
   gender: z.enum(['MALE', 'FEMALE']),
@@ -63,8 +84,24 @@ const searchQuerySchema = z.object({
   education: z.string().max(100).optional(),
   profession: z.string().max(100).optional(),
   page: z.coerce.number().int().min(1).default(1),
-  limit: z.coerce.number().int().min(1).max(50).default(20),
 });
+
+const verificationSchema = z.object({
+  govtIdType: z.enum(['Aadhaar', 'PAN', 'Passport', 'Driving Licence']),
+  govtIdLast4: z.string().regex(/^\d{4}$/, 'Sirf last 4 digit daalo'),
+});
+
+const photoSelect = {
+  select: {
+    id: true,
+    url: true,
+    storageKey: true,
+    blurUrl: true,
+    isPrimary: true,
+    createdAt: true,
+  },
+  orderBy: { createdAt: 'asc' as const },
+};
 
 const profileSelect = {
   id: true,
@@ -88,9 +125,56 @@ const profileSelect = {
   isVerified: true,
   createdAt: true,
   updatedAt: true,
-  photos: { orderBy: { createdAt: 'asc' as const } },
+  photos: photoSelect,
   user: { select: { id: true, email: true, isVerified: true } },
 };
+
+type ProfileRow = Awaited<ReturnType<typeof prisma.profile.findUnique>> extends infer T
+  ? // Prisma select type — runtime me plain object aata hai, isliye loose type:
+    Record<string, unknown> & {
+      userId: string;
+      photos: Array<Record<string, unknown> & { id: string; url: string; storageKey: string | null; blurUrl: string | null; isPrimary: boolean }>;
+      user: { id: string; email: string; isVerified: boolean };
+    }
+  : never;
+
+/** Viewer ke permissions ke hisaab se profile fields + photo URLs gate karo. */
+async function gateProfile(profile: ProfileRow, perms: Permissions, viewerUserId: string) {
+  const isOwner = profile.userId === viewerUserId;
+  const p: Record<string, unknown> = { ...profile };
+
+  if (!isOwner && !perms.canSeeBiodata) {
+    // Free user: sirf basic info — biodata fields chhupao.
+    for (const f of ['education', 'profession', 'incomeAnnual', 'about', 'religion', 'caste', 'heightCm', 'maritalStatus', 'dob']) {
+      delete p[f];
+    }
+  }
+  if (!isOwner && !perms.canSeeContacts) {
+    p.user = { id: (profile.user as { id: string }).id, isVerified: (profile.user as { isVerified: boolean }).isVerified };
+  }
+  if (isOwner || perms.canSeePhotos) {
+    // Original photo — signed URL (5 min expiry).
+    p.photos = await Promise.all(
+      profile.photos.map(async (ph) => ({
+        id: ph.id,
+        url: await signedPhotoUrl({ id: ph.id as string, url: ph.url as string, storageKey: ph.storageKey as string | null }),
+        blurUrl: ph.blurUrl,
+        isPrimary: ph.isPrimary,
+        createdAt: ph.createdAt,
+      })),
+    );
+  } else {
+    // Free user: sirf blurred thumbnail, original ka URL bilkul nahi.
+    p.photos = profile.photos.map((ph) => ({
+      id: ph.id,
+      url: null,
+      blurUrl: ph.blurUrl,
+      isPrimary: ph.isPrimary,
+      createdAt: ph.createdAt,
+    }));
+  }
+  return p;
+}
 
 type SearchQuery = z.infer<typeof searchQuerySchema>;
 
@@ -140,7 +224,8 @@ router.get('/me', requireAuth, async (req: Request, res: Response) => {
       res.status(404).json({ error: 'Profile abhi bana nahi hai' });
       return;
     }
-    res.json({ profile });
+    const perms = await getPermissions(req.user!.userId);
+    res.json({ profile: await gateProfile(profile as unknown as ProfileRow, perms, req.user!.userId) });
   } catch (err) {
     console.error('[profiles/me]', err);
     res.status(500).json({ error: 'Profile fetch fail ho gaya' });
@@ -172,6 +257,13 @@ router.patch('/me', requireAuth, validate(profileUpdateSchema), async (req: Requ
 router.get('/', requireAuth, validate(searchQuerySchema, 'query'), async (req: Request, res: Response) => {
   const q = (req as unknown as { validatedQuery: SearchQuery }).validatedQuery;
   try {
+    const perms = await getPermissions(req.user!.userId);
+    const cacheKey = `search:${perms.packageName}:${JSON.stringify(q)}:${req.user!.userId}`;
+    const cached = await cacheGet<{ profiles: unknown[]; meta: unknown }>(cacheKey);
+    if (cached) {
+      res.json(cached);
+      return;
+    }
     const where: Record<string, unknown> = { isActive: true };
     if (q.gender) where.gender = q.gender;
     if (q.city) where.city = { contains: q.city, mode: 'insensitive' };
@@ -194,21 +286,38 @@ router.get('/', requireAuth, validate(searchQuerySchema, 'query'), async (req: R
       }
       where.dob = dobFilter;
     }
-    const skip = (q.page - 1) * q.limit;
+    // Free plan: total dikhne wale profiles maxProfilesVisible tak simit.
+    const effectivePageSize = PAGE_SIZE;
+    const skip = (q.page - 1) * effectivePageSize;
+    const maxSkip = Math.max(0, perms.maxProfilesVisible - skip);
+    const take = Math.min(effectivePageSize, maxSkip);
     const [profiles, total] = await Promise.all([
-      prisma.profile.findMany({
-        where,
-        select: profileSelect,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: q.limit,
-      }),
+      take > 0
+        ? prisma.profile.findMany({
+            where,
+            select: profileSelect,
+            orderBy: { createdAt: 'desc' },
+            skip,
+            take,
+          })
+        : Promise.resolve([]),
       prisma.profile.count({ where }),
     ]);
-    res.json({
-      profiles,
-      meta: { total, page: q.page, limit: q.limit, totalPages: Math.ceil(total / q.limit) },
-    });
+    const gated = await Promise.all(
+      (profiles as unknown as ProfileRow[]).map((p) => gateProfile(p, perms, req.user!.userId)),
+    );
+    const result = {
+      profiles: gated,
+      meta: {
+        total: Math.min(total, perms.maxProfilesVisible),
+        page: q.page,
+        limit: PAGE_SIZE,
+        totalPages: Math.ceil(Math.min(total, perms.maxProfilesVisible) / PAGE_SIZE),
+        package: perms.packageName,
+      },
+    };
+    await cacheSet(cacheKey, result, 120); // search max 2 min cache
+    res.json(result);
   } catch (err) {
     console.error('[profiles/search]', err);
     res.status(500).json({ error: 'Search fail ho gaya' });
@@ -225,7 +334,9 @@ router.get('/:id', requireAuth, async (req: Request, res: Response) => {
       res.status(404).json({ error: 'Profile nahi mila' });
       return;
     }
-    res.json({ profile });
+    const perms = await getPermissions(req.user!.userId);
+    await logAudit(req.user!.userId, 'profile_view', req, `profile:${profile.id}`);
+    res.json({ profile: await gateProfile(profile as unknown as ProfileRow, perms, req.user!.userId) });
   } catch (err) {
     console.error('[profiles/get]', err);
     res.status(500).json({ error: 'Profile fetch fail ho gaya' });
@@ -258,6 +369,11 @@ router.post(
         res.status(400).json({ error: 'photo field me image file bhejo' });
         return;
       }
+      // Magic bytes check — mimetype spoof ho sakta hai.
+      if (!checkMagicBytes(req.file.buffer)) {
+        res.status(400).json({ error: 'File asli image nahi lagti — sirf JPEG/PNG/WebP allowed hain' });
+        return;
+      }
       const profile = await prisma.profile.findUnique({ where: { userId: req.user!.userId } });
       if (!profile) {
         res.status(404).json({ error: 'Pehle profile banao, phir photo upload karo' });
@@ -268,17 +384,28 @@ router.post(
         res.status(400).json({ error: `Ek profile pe max ${MAX_PHOTOS_PER_PROFILE} photos allowed hain` });
         return;
       }
-      const filename = `${profile.id}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.jpg`;
-      const filepath = path.join(UPLOADS_DIR, filename);
-      // Sharp se max 800px width pe resize + JPEG me convert (quality 82).
-      await sharp(req.file.buffer)
-        .resize(800, 800, { fit: 'inside', withoutEnlargement: true })
+      const keyBase = `${profile.id}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+      // Sharp re-encode: .rotate() EXIF orientation apply karta hai aur EXIF/GPS
+      // metadata hata deta hai; max 2000px; JPEG quality 82.
+      const original = await sharp(req.file.buffer)
+        .rotate()
+        .resize(MAX_DIMENSION, MAX_DIMENSION, { fit: 'inside', withoutEnlargement: true })
         .jpeg({ quality: 82 })
-        .toFile(filepath);
+        .toBuffer();
+      // Blurred thumbnail (Free users ke liye) — 200px + heavy blur.
+      const blur = await sharp(req.file.buffer)
+        .rotate()
+        .resize(200, 200, { fit: 'inside', withoutEnlargement: true })
+        .blur(25)
+        .jpeg({ quality: 60 })
+        .toBuffer();
+      const uploaded = await uploadPhoto(original, blur, keyBase);
       const photo = await prisma.photo.create({
         data: {
           profileId: profile.id,
-          url: `/uploads/${filename}`,
+          url: uploaded.url,
+          storageKey: uploaded.storageKey,
+          blurUrl: uploaded.blurUrl,
           isPrimary: count === 0,
         },
       });
@@ -305,8 +432,8 @@ router.delete('/me/photos/:photoId', requireAuth, async (req: Request, res: Resp
       return;
     }
     await prisma.photo.delete({ where: { id: photo.id } });
-    const filePath = path.join(UPLOADS_DIR, path.basename(photo.url));
-    fs.unlink(filePath, () => undefined);
+    // Storage se bhi delete karo — sirf DB se nahi.
+    await deletePhoto(photo.storageKey);
     // Agar primary photo delete hui to sabse purani bachi photo ko primary banao.
     if (photo.isPrimary) {
       const next = await prisma.photo.findFirst({
@@ -322,4 +449,174 @@ router.delete('/me/photos/:photoId', requireAuth, async (req: Request, res: Resp
   }
 });
 
+// ---- Profile verification (Level 2 Govt ID + Level 3 selfie) ----
+// Level 1 = emailVerified + phoneVerified (User flags). Yahan Level 2/3 submit hota hai.
+// isVerified sirf admin approve karne par true hota hai (src/routes/admin.ts).
+router.post(
+  '/me/verification',
+  requireAuth,
+  (req: Request, res: Response, next) => {
+    upload.single('selfie')(req, res, (err: unknown) => {
+      if (err instanceof Error) {
+        res.status(400).json({ error: err.message });
+        return;
+      }
+      next();
+    });
+  },
+  validate(verificationSchema),
+  async (req: Request, res: Response) => {
+    const { govtIdType, govtIdLast4 } = req.body as z.infer<typeof verificationSchema>;
+    try {
+      const profile = await prisma.profile.findUnique({ where: { userId: req.user!.userId } });
+      if (!profile) {
+        res.status(404).json({ error: 'Pehle profile banao' });
+        return;
+      }
+      let selfieUrl: string | undefined;
+      let selfieKey: string | undefined;
+      if (req.file) {
+        if (!checkMagicBytes(req.file.buffer)) {
+          res.status(400).json({ error: 'Selfie asli image nahi lagti' });
+          return;
+        }
+        const buf = await sharp(req.file.buffer)
+          .rotate()
+          .resize(800, 800, { fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: 80 })
+          .toBuffer();
+        const uploaded = await uploadPhoto(buf, buf, `${profile.id}-selfie-${Date.now()}`);
+        selfieUrl = uploaded.url;
+        selfieKey = uploaded.storageKey;
+      }
+      const verification = await prisma.verification.upsert({
+        where: { profileId: profile.id },
+        update: {
+          govtIdType,
+          govtIdLast4,
+          ...(selfieUrl ? { selfieUrl, selfieKey, level: 3 } : { level: 2 }),
+          status: 'PENDING',
+          reviewedBy: null,
+          reviewedAt: null,
+          rejectReason: null,
+        },
+        create: {
+          profileId: profile.id,
+          govtIdType,
+          govtIdLast4,
+          selfieUrl: selfieUrl ?? null,
+          selfieKey: selfieKey ?? null,
+          level: selfieUrl ? 3 : 2,
+          status: 'PENDING',
+        },
+      });
+      // Poora ID number kabhi response me mat bhejo — sirf last 4 digit.
+      res.status(201).json({
+        verification: {
+          id: verification.id,
+          level: verification.level,
+          govtIdType: verification.govtIdType,
+          govtIdLast4: verification.govtIdLast4,
+          status: verification.status,
+        },
+        message: 'Verification submit ho gayi — admin review karega',
+      });
+    } catch (err) {
+      console.error('[profiles/verification]', err);
+      res.status(500).json({ error: 'Verification submit fail ho gaya' });
+    }
+  },
+);
+
+router.get('/me/verification', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const profile = await prisma.profile.findUnique({ where: { userId: req.user!.userId } });
+    if (!profile) {
+      res.status(404).json({ error: 'Profile abhi bana nahi hai' });
+      return;
+    }
+    const verification = await prisma.verification.findUnique({ where: { profileId: profile.id } });
+    if (!verification) {
+      res.json({ verification: null });
+      return;
+    }
+    res.json({
+      verification: {
+        id: verification.id,
+        level: verification.level,
+        govtIdType: verification.govtIdType,
+        govtIdLast4: verification.govtIdLast4,
+        status: verification.status,
+        rejectReason: verification.rejectReason,
+      },
+    });
+  } catch (err) {
+    console.error('[profiles/verification-get]', err);
+    res.status(500).json({ error: 'Verification fetch fail ho gaya' });
+  }
+});
+
 export default router;
+
+// ---- Public photo file routes — /api/photos par mount hota hai (index.ts) ----
+// Original photo: sirf HMAC-signed URL (5 min) se, aur sirf owner / paid user ko.
+// Blurred thumbnail: public hai (blurred hi hai), sirf *-blur.jpg files serve hoti hain.
+export const photoFileRouter = Router();
+
+photoFileRouter.get('/thumb/:filename', (req: Request, res: Response) => {
+  const filename = String(req.params.filename);
+  if (!filename.endsWith('-blur.jpg') || filename.includes('/') || filename.includes('..')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const filePath = localFilePath(filename);
+  if (!fs.existsSync(filePath)) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  res.setHeader('Content-Type', 'image/jpeg');
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+  res.sendFile(filePath);
+});
+
+photoFileRouter.get('/:photoId/file', requireAuth, async (req: Request, res: Response) => {
+  const { sig, exp } = req.query as { sig?: string; exp?: string };
+  if (!sig || !exp || !verifyPhotoSig(String(req.params.photoId), sig, exp)) {
+    res.status(403).json({ error: 'Link expired ya galat hai — photo dobara kholo' });
+    return;
+  }
+  try {
+    const photo = await prisma.photo.findUnique({
+      where: { id: String(req.params.photoId) },
+      include: { profile: true },
+    });
+    if (!photo) {
+      res.status(404).json({ error: 'Photo nahi mili' });
+      return;
+    }
+    const isOwner = photo.profile.userId === req.user!.userId;
+    const perms = await getPermissions(req.user!.userId);
+    if (!isOwner && !perms.canSeePhotos) {
+      res.status(403).json({ error: 'Photo dekhne ke liye paid package chahiye' });
+      return;
+    }
+    if (photo.storageKey && !photo.url.startsWith('local:')) {
+      // Cloudinary/Supabase: provider signed URL par redirect karo.
+      const signed = await signedPhotoUrl({ id: photo.id, url: photo.url, storageKey: photo.storageKey });
+      res.redirect(302, signed);
+      return;
+    }
+    const filename = photo.storageKey ?? photo.url.replace(/^local:/, '');
+    const filePath = localFilePath(filename);
+    if (!fs.existsSync(filePath)) {
+      res.status(404).json({ error: 'Photo file nahi mili' });
+      return;
+    }
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.sendFile(filePath);
+  } catch (err) {
+    console.error('[photos/file]', err);
+    res.status(500).json({ error: 'Photo fetch fail ho gaya' });
+  }
+});

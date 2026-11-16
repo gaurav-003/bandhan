@@ -1,6 +1,6 @@
 // JWT auth middleware — Bearer token verify karke req.user set karta hai.
 import { Request, Response, NextFunction } from 'express';
-import { verifyToken, AuthTokenPayload } from '../lib/auth';
+import { verifyAccessToken, AuthTokenPayload } from '../lib/auth';
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
@@ -19,7 +19,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   }
   const token = header.slice('Bearer '.length).trim();
   try {
-    req.user = verifyToken(token);
+    req.user = verifyAccessToken(token);
     next();
   } catch {
     res.status(401).json({ error: 'Unauthorized — invalid or expired token' });

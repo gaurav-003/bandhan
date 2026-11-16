@@ -7,8 +7,9 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 enum Role {
@@ -46,6 +47,12 @@ enum InterestStatus {
   DECLINED
 }
 
+enum VerificationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
 model User {
   id                String         @id @default(cuid())
   email             String         @unique
@@ -54,6 +61,7 @@ model User {
   role              Role           @default(USER)
   isVerified        Boolean        @default(false)
   emailVerified     Boolean        @default(false) // email confirmation link se verify hota hai
+  phoneVerified     Boolean        @default(false) // OTP se verify hota hai
   createdAt         DateTime       @default(now())
   updatedAt         DateTime       @updatedAt
   profile           Profile?
@@ -89,17 +97,58 @@ model Profile {
   updatedAt     DateTime @updatedAt
   photos        Photo[]
   shortlistedBy Shortlist[]
+  verification  Verification?
+
+  @@index([city, gender, age, isActive])
 }
 
 model Photo {
-  id        String   @id @default(cuid())
-  profileId String
-  profile   Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
-  url       String
-  isPrimary Boolean  @default(false)
-  createdAt DateTime @default(now())
+  id         String   @id @default(cuid())
+  profileId  String
+  profile    Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  url        String
+  storageKey String? // Cloudinary public_id / Supabase path / local filename
+  blurUrl    String? // Free users ko dikhne wala blurred thumbnail
+  isPrimary  Boolean  @default(false)
+  createdAt  DateTime @default(now())
 
   @@index([profileId])
+}
+
+// Profile verification — Level 1 email+phone (User flags), Level 2 Govt ID,
+// Level 3 selfie match. Poora Govt ID number kabhi store nahi hota, sirf last 4 digit.
+model Verification {
+  id           String             @id @default(cuid())
+  profileId    String             @unique
+  profile      Profile            @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  level        Int                @default(1)
+  govtIdType   String? // Aadhaar / PAN / Passport / Driving Licence
+  govtIdLast4  String? // sirf last 4 digit
+  selfieUrl    String?
+  selfieKey    String?
+  status       VerificationStatus @default(PENDING)
+  reviewedBy   String?
+  reviewedAt   DateTime?
+  rejectReason String?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+}
+
+// Audit log — userId plain string hai (koi FK nahi) taaki user delete ke baad
+// bhi log bacha rahe. Actions: login, logout, password_change, profile_view,
+// interest_send, interest_accept, interest_decline, payment, admin_approve, admin_reject.
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  action    String
+  ip        String?
+  userAgent String?
+  details   String?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
 }
 
 model Package {
@@ -148,6 +197,7 @@ model Payment {
   createdAt         DateTime      @default(now())
 
   @@index([userId])
+  @@index([razorpayPaymentId])
 }
 
 model Interest {

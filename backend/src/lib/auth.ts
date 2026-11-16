@@ -14,6 +14,8 @@ export interface AuthTokenPayload {
   userId: string;
   email: string;
   role: string;
+  /** 'access' = 15-min token (lib/tokens.ts). Missing = legacy 7d token (compat). */
+  type?: 'access' | 'refresh';
 }
 
 const SALT_ROUNDS = 12;
@@ -27,7 +29,16 @@ export async function comparePassword(password: string, hash: string): Promise<b
 }
 
 export function signToken(payload: AuthTokenPayload): string {
+  // Legacy 7d token — naye code me issueTokenPair (15m access + 7d refresh) use karo.
+  // Ye sirf backward-compat ke liye rakha hai.
   return jwt.sign(payload, JWT_SECRET as string, { expiresIn: JWT_EXPIRES_IN });
+}
+
+/** Access token verify karo — refresh token ko access token ki tarah use nahi kar sakte. */
+export function verifyAccessToken(token: string): AuthTokenPayload {
+  const payload = verifyToken(token);
+  if (payload.type === 'refresh') throw new Error('Refresh token cannot be used as access token');
+  return payload;
 }
 
 export function verifyToken(token: string): AuthTokenPayload {

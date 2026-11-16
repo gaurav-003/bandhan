@@ -1,7 +1,9 @@
-// Auth routes — register / login / OTP / me + EMAIL CONFIRMATION flow.
+// Auth routes — register / login / OTP / me + EMAIL CONFIRMATION flow + refresh tokens.
 // Email confirmation flow: request-confirmation -> mail me link -> confirm (302 redirect)
-// -> set-password. OTP abhi DEV MODE me hai: asli SMS/email provider nahi juda hai.
-// Production me `devOtp` / `devConfirmUrl` field hatana hai aur real SMTP judna hai.
+// -> set-password. Link single-use hai (confirm par token delete hota hai).
+// OTP: 1 ghante me max 5 send, 5 galat try par 15 min block (src/lib/otp.ts).
+// Tokens: access 15 min + refresh 7 din with rotation (src/lib/tokens.ts).
+// Production me devOtp / devConfirmUrl kabhi response me nahi aate.
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import { z } from 'zod';
@@ -10,19 +12,19 @@ import { redis } from '../lib/redis';
 import {
   hashPassword,
   comparePassword,
-  signToken,
   generateOtp,
   signSetPasswordToken,
   verifySetPasswordToken,
 } from '../lib/auth';
-import { sendConfirmationEmail } from '../lib/mailer';
+import { issueTokenPair, rotateRefreshToken, revokeRefreshToken, revokeAllRefreshTokens } from '../lib/tokens';
+import { checkOtpSendAllowed, storeOtp, checkOtp } from '../lib/otp';
+import { sendConfirmationEmail } from '../lib/mail';
 import { validate, publicUser } from '../middleware/validate';
 import { requireAuth } from '../middleware/auth';
+import { logAudit } from '../lib/audit';
 
 const router = Router();
-
-const OTP_TTL_SECONDS = 600; // 10 minute
-const OTP_PREFIX = 'otp:';
+const isDev = process.env.NODE_ENV === 'development';
 
 // Email confirmation token: 24 ghante valid.
 const CONFIRM_TTL_SECONDS = 24 * 60 * 60;
@@ -33,7 +35,8 @@ const CONFIRM_RATE_WINDOW_SECONDS = 60 * 60;
 const CONFIRM_RATE_PREFIX = 'email-confirm-rate:';
 
 const API_BASE_URL = process.env.API_BASE_URL || 'http://127.0.0.1:4000';
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://127.0.0.1:3000';
+// FRONTEND_URL comma-list ho sakta hai (CORS ke liye) — redirect ke liye pehla origin lo.
+const FRONTEND_URL = (process.env.FRONTEND_URL || 'http://127.0.0.1:3000').split(',')[0].trim();
 
 const registerSchema = z.object({
   email: z.string().email('Valid email chahiye'),
@@ -63,8 +66,18 @@ const verifyOtpSchema = z
   })
   .refine((d) => d.email || d.phone, { message: 'email ya phone me se ek chahiye' });
 
-function otpKey(identifier: string): string {
-  return `${OTP_PREFIX}${identifier.toLowerCase()}`;
+const refreshSchema = z.object({
+  refreshToken: z.string().min(1, 'refreshToken chahiye'),
+});
+
+const logoutSchema = z.object({
+  refreshToken: z.string().min(1, 'refreshToken chahiye').optional(),
+});
+
+/** Login/register response — `token` purana naam hai (frontend compat), accessToken naya. */
+async function tokenResponse(user: { id: string; email: string; role: string }) {
+  const pair = await issueTokenPair({ userId: user.id, email: user.email, role: user.role });
+  return { token: pair.accessToken, accessToken: pair.accessToken, refreshToken: pair.refreshToken };
 }
 
 router.post('/register', validate(registerSchema), async (req: Request, res: Response) => {
@@ -81,9 +94,8 @@ router.post('/register', validate(registerSchema), async (req: Request, res: Res
     const user = await prisma.user.create({
       data: { email, passwordHash, phone: phone ?? null },
     });
-    const token = signToken({ userId: user.id, email: user.email, role: user.role });
     res.status(201).json({
-      token,
+      ...(await tokenResponse(user)),
       user: { ...publicUser(user), firstName, lastName },
       message: 'Account ban gaya. Ab apna profile banao.',
     });
@@ -111,11 +123,34 @@ router.post('/login', validate(loginSchema), async (req: Request, res: Response)
       res.status(401).json({ error: 'Invalid email or password' });
       return;
     }
-    const token = signToken({ userId: user.id, email: user.email, role: user.role });
-    res.json({ token, user: publicUser(user) });
+    await logAudit(user.id, 'login', req);
+    res.json({ ...(await tokenResponse(user)), user: publicUser(user) });
   } catch (err) {
     console.error('[auth/login]', err);
     res.status(500).json({ error: 'Login fail ho gaya' });
+  }
+});
+
+// Access token expire hone par refresh token se naya pair lo (rotation).
+router.post('/refresh', validate(refreshSchema), async (req: Request, res: Response) => {
+  const { refreshToken } = req.body as z.infer<typeof refreshSchema>;
+  try {
+    const pair = await rotateRefreshToken(refreshToken);
+    res.json({ token: pair.accessToken, accessToken: pair.accessToken, refreshToken: pair.refreshToken });
+  } catch {
+    res.status(401).json({ error: 'Invalid or expired refresh token' });
+  }
+});
+
+router.post('/logout', requireAuth, validate(logoutSchema), async (req: Request, res: Response) => {
+  const { refreshToken } = req.body as z.infer<typeof logoutSchema>;
+  try {
+    if (refreshToken) await revokeRefreshToken(refreshToken);
+    await logAudit(req.user!.userId, 'logout', req);
+    res.json({ message: 'Logged out' });
+  } catch (err) {
+    console.error('[auth/logout]', err);
+    res.status(500).json({ error: 'Logout fail ho gaya' });
   }
 });
 
@@ -123,15 +158,19 @@ router.post('/send-otp', validate(sendOtpSchema), async (req: Request, res: Resp
   const { email, phone } = req.body as z.infer<typeof sendOtpSchema>;
   const identifier = (email ?? phone) as string;
   try {
+    const allowed = await checkOtpSendAllowed(identifier);
+    if (!allowed) {
+      res.status(429).json({ error: 'Bahut zyada OTP requests — 1 ghante baad dobara try karo' });
+      return;
+    }
     const otp = generateOtp();
-    await redis.set(otpKey(identifier), otp, 'EX', OTP_TTL_SECONDS);
-    // DEV MODE: OTP console pe log hota hai aur development me response me bhi
-    // milta hai, kyunki asli SMS/email provider (MSG91 / SMTP) abhi juda nahi hai.
-    // TODO (production): ye devOtp field hatana hai + MSG91/nodemailer se bhejna hai.
-    console.log(`[auth/otp] DEV MODE — OTP for ${identifier}: ${otp} (10 min valid)`);
+    await storeOtp(identifier, otp);
+    // DEV MODE only: OTP console pe log hota hai. Production me kabhi
+    // response me nahi aata — asli SMS/email provider se bhejna hoga.
+    console.log(`[auth/otp] OTP for ${identifier} generated (10 min valid)`);
     res.json({
       message: 'OTP bhej diya gaya hai (10 minute valid)',
-      ...(process.env.NODE_ENV === 'development' ? { devOtp: otp } : {}),
+      ...(isDev ? { devOtp: otp } : {}),
     });
   } catch (err) {
     console.error('[auth/send-otp]', err);
@@ -143,12 +182,15 @@ router.post('/verify-otp', validate(verifyOtpSchema), async (req: Request, res: 
   const { email, phone, otp } = req.body as z.infer<typeof verifyOtpSchema>;
   const identifier = (email ?? phone) as string;
   try {
-    const stored = await redis.get(otpKey(identifier));
-    if (!stored || stored !== otp) {
+    const result = await checkOtp(identifier, otp);
+    if (result === 'blocked') {
+      res.status(429).json({ error: 'Bahut zyada galat OTP — 15 minute baad dobara try karo' });
+      return;
+    }
+    if (result !== 'ok') {
       res.status(400).json({ error: 'Invalid ya expired OTP' });
       return;
     }
-    await redis.del(otpKey(identifier));
     const user = await prisma.user.findFirst({
       where: email ? { email } : { phone },
     });
@@ -158,10 +200,14 @@ router.post('/verify-otp', validate(verifyOtpSchema), async (req: Request, res: 
     }
     const updated = await prisma.user.update({
       where: { id: user.id },
-      data: { isVerified: true },
+      data: { isVerified: true, ...(email ? { emailVerified: true } : { phoneVerified: true }) },
     });
-    const token = signToken({ userId: updated.id, email: updated.email, role: updated.role });
-    res.json({ token, user: publicUser(updated), message: 'OTP verified — account verify ho gaya' });
+    await logAudit(updated.id, 'otp_verified', req);
+    res.json({
+      ...(await tokenResponse(updated)),
+      user: publicUser(updated),
+      message: 'OTP verified — account verify ho gaya',
+    });
   } catch (err) {
     console.error('[auth/verify-otp]', err);
     res.status(500).json({ error: 'OTP verify fail ho gaya' });
@@ -216,21 +262,18 @@ router.post('/request-confirmation', validate(requestConfirmationSchema), async 
     await redis.set(`${CONFIRM_PREFIX}${token}`, user.id, 'EX', CONFIRM_TTL_SECONDS);
     const confirmUrl = `${API_BASE_URL}/api/auth/confirm?token=${token}`;
 
-    let previewUrl: string | null = null;
     try {
-      previewUrl = await sendConfirmationEmail(normalizedEmail, confirmUrl);
+      await sendConfirmationEmail(normalizedEmail, confirmUrl);
     } catch (err) {
       // Email fail ho to bhi flow mat todo — dev mode me URL response me milta hai.
       console.error('[auth/request-confirmation] email fail:', (err as Error).message);
     }
 
-    // DEV MODE: confirm URL response me milta hai taaki bina real SMTP ke bhi
-    // testing ho sake. TODO (production): devConfirmUrl / devPreviewUrl hatana hai.
+    // DEV MODE only: confirm URL response me milta hai taaki bina real mail
+    // provider ke bhi testing ho sake. Production me kabhi nahi.
     res.json({
       message: 'Agar ye email registered hai to confirmation mail bhej diya gaya hai',
-      ...(process.env.NODE_ENV === 'development'
-        ? { devConfirmUrl: confirmUrl, ...(previewUrl ? { devPreviewUrl: previewUrl } : {}) }
-        : {}),
+      ...(isDev ? { devConfirmUrl: confirmUrl } : {}),
     });
   } catch (err) {
     console.error('[auth/request-confirmation]', err);
@@ -239,6 +282,7 @@ router.post('/request-confirmation', validate(requestConfirmationSchema), async 
 });
 
 // Step 2: user mail me link pe click karta hai -> verify karke website pe redirect.
+// Token single-use hai — yahan delete hota hai, dobara click par 400 aayega.
 router.get('/confirm', validate(confirmQuerySchema, 'query'), async (req: Request, res: Response) => {
   const { token } = (req as unknown as { validatedQuery: z.infer<typeof confirmQuerySchema> }).validatedQuery;
   try {
@@ -252,6 +296,7 @@ router.get('/confirm', validate(confirmQuerySchema, 'query'), async (req: Reques
       where: { id: userId },
       data: { emailVerified: true, isVerified: true },
     });
+    await logAudit(user.id, 'email_confirmed', req);
     // 30-min ka set-password token — website isse password form kholegi.
     const setToken = signSetPasswordToken(user.id, user.email);
     const separator = FRONTEND_URL.includes('?') ? '&' : '?';
@@ -287,8 +332,14 @@ router.post('/set-password', validate(setPasswordSchema), async (req: Request, r
       where: { id: user.id },
       data: { passwordHash, isVerified: true, emailVerified: true },
     });
-    const token = signToken({ userId: updated.id, email: updated.email, role: updated.role });
-    res.json({ token, user: publicUser(updated), message: 'Password set ho gaya — account ready hai!' });
+    // Password change par saare purane refresh tokens revoke karo.
+    await revokeAllRefreshTokens(user.id);
+    await logAudit(updated.id, 'password_change', req);
+    res.json({
+      ...(await tokenResponse(updated)),
+      user: publicUser(updated),
+      message: 'Password set ho gaya — account ready hai!',
+    });
   } catch (err) {
     console.error('[auth/set-password]', err);
     res.status(500).json({ error: 'Password set karne me fail ho gaya' });

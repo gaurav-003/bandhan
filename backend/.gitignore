@@ -5,6 +5,3 @@ dist/
 uploads/
 *.log
 .DS_Store
-
-pgdata/
-*.rdb
